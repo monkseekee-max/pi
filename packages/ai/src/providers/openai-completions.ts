@@ -31,6 +31,7 @@ import type {
 	ToolResultMessage,
 } from "../types.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
+import { shortHash } from "../utils/hash.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
@@ -39,6 +40,30 @@ import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copi
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 import { transformMessages } from "./transform-messages.ts";
+
+function normalizeCompletionToolCallIdPart(part: string | undefined, fallback: string): string {
+	const raw = typeof part === "string" ? part : "";
+	const sanitized = raw.replace(/[^a-zA-Z0-9_-]/g, "_");
+	const normalized = (sanitized.length > 40 ? sanitized.slice(0, 40) : sanitized).replace(/_+$/, "");
+	return normalized || fallback;
+}
+
+function fallbackCompletionToolCallId(seed: string | undefined): string {
+	return `call_${shortHash(seed || "missing_tool_call_id")}`;
+}
+
+function normalizeCompletionToolCallId(id: string | undefined, normalizePlainId: boolean, seed?: string): string {
+	const rawId = typeof id === "string" ? id : "";
+	if (rawId.includes("|")) {
+		const [rawCallId, rawItemId] = rawId.split("|");
+		return normalizeCompletionToolCallIdPart(
+			rawCallId,
+			fallbackCompletionToolCallId(rawCallId || rawItemId || seed || rawId),
+		);
+	}
+	if (!normalizePlainId && rawId) return rawId;
+	return normalizeCompletionToolCallIdPart(rawId, fallbackCompletionToolCallId(seed || rawId));
+}
 
 /**
  * Check if conversation messages contain tool calls or tool results.
@@ -169,6 +194,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			let hasFinishReason = false;
 			const toolCallBlocksByIndex = new Map<number, StreamingToolCallBlock>();
 			const toolCallBlocksById = new Map<string, StreamingToolCallBlock>();
+			let lastToolCallBlock: StreamingToolCallBlock | null = null;
 			const blocks = output.content as StreamingBlock[];
 			const getContentIndex = (block: StreamingBlock) => blocks.indexOf(block);
 			const finishBlock = (block: StreamingBlock) => {
@@ -230,6 +256,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 				if (!block && toolCall.id) {
 					block = toolCallBlocksById.get(toolCall.id);
 				}
+				if (!block && !toolCall.id && !toolCall.function?.name && lastToolCallBlock) {
+					block = lastToolCallBlock;
+				}
 				if (!block) {
 					block = {
 						type: "toolCall",
@@ -252,6 +281,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 						partial: output,
 					});
 				}
+				lastToolCallBlock = block;
 				if (streamIndex !== undefined && block.streamIndex === undefined) {
 					block.streamIndex = streamIndex;
 					toolCallBlocksByIndex.set(streamIndex, block);
@@ -745,22 +775,11 @@ export function convertMessages(
 ): ChatCompletionMessageParam[] {
 	const params: ChatCompletionMessageParam[] = [];
 
-	const normalizeToolCallId = (id: string): string => {
-		// Handle pipe-separated IDs from OpenAI Responses API
-		// Format: {call_id}|{id} where {id} can be 400+ chars with special chars (+, /, =)
-		// These come from providers like github-copilot, openai-codex, opencode
-		// Extract just the call_id part and normalize it
-		if (id.includes("|")) {
-			const [callId] = id.split("|");
-			// Sanitize to allowed chars and truncate to 40 chars (OpenAI limit)
-			return callId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 40);
-		}
-
-		if (model.provider === "openai") return id.length > 40 ? id.slice(0, 40) : id;
-		return id;
-	};
+	const normalizeToolCallId = (id: string): string =>
+		normalizeCompletionToolCallId(id, model.provider === "openai", id);
 
 	const transformedMessages = transformMessages(context.messages, model, (id) => normalizeToolCallId(id));
+	const emittedToolCallIds = new Set<string>();
 
 	if (context.systemPrompt) {
 		const useDeveloperRole = model.reasoning && compat.supportsDeveloperRole;
@@ -866,16 +885,20 @@ export function convertMessages(
 				assistantMsg.content = assistantText;
 			}
 
-			const toolCalls = msg.content.filter(isToolCallBlock);
+			const toolCalls = msg.content.filter(isToolCallBlock).filter((tc) => tc.id && tc.name);
 			if (toolCalls.length > 0) {
-				assistantMsg.tool_calls = toolCalls.map((tc) => ({
-					id: tc.id,
-					type: "function" as const,
-					function: {
-						name: tc.name,
-						arguments: JSON.stringify(tc.arguments),
-					},
-				}));
+				assistantMsg.tool_calls = toolCalls.map((tc) => {
+					const id = normalizeToolCallId(tc.id);
+					emittedToolCallIds.add(id);
+					return {
+						id,
+						type: "function" as const,
+						function: {
+							name: tc.name,
+							arguments: JSON.stringify(tc.arguments),
+						},
+					};
+				});
 				const reasoningDetails = toolCalls
 					.filter((tc) => tc.thoughtSignature)
 					.map((tc) => {
@@ -926,11 +949,15 @@ export function convertMessages(
 
 				// Always send tool result with text (or placeholder if only images)
 				const hasText = textResult.length > 0;
+				const toolCallId = normalizeToolCallId(toolMsg.toolCallId);
+				if (!emittedToolCallIds.has(toolCallId)) {
+					continue;
+				}
 				// Some providers require the 'name' field in tool results
 				const toolResultMsg: ChatCompletionToolMessageParam = {
 					role: "tool",
 					content: sanitizeSurrogates(hasText ? textResult : "(see attached image)"),
-					tool_call_id: toolMsg.toolCallId,
+					tool_call_id: toolCallId,
 				};
 				if (compat.requiresToolResultName && toolMsg.toolName) {
 					(toolResultMsg as any).name = toolMsg.toolName;
