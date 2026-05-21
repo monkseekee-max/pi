@@ -63,6 +63,39 @@ function parseTextSignature(
 	return { id: signature };
 }
 
+function normalizeResponsesIdPart(part: string | undefined, fallback: string): string {
+	const raw = typeof part === "string" ? part : "";
+	const sanitized = raw.replace(/[^a-zA-Z0-9_-]/g, "_");
+	const normalized = (sanitized.length > 64 ? sanitized.slice(0, 64) : sanitized).replace(/_+$/, "");
+	return normalized || fallback;
+}
+
+function fallbackResponsesCallId(seed: string | undefined): string {
+	return `call_${shortHash(seed || "missing_call_id")}`;
+}
+
+function fallbackResponsesItemId(seed: string | undefined): string {
+	return `fc_${shortHash(seed || "missing_item_id")}`;
+}
+
+function splitResponsesToolId(id: string | undefined, seed?: string): { callId: string; itemId?: string } {
+	const rawId = typeof id === "string" ? id : "";
+	const separatorIndex = rawId.indexOf("|");
+	if (separatorIndex === -1) {
+		return {
+			callId: normalizeResponsesIdPart(rawId, fallbackResponsesCallId(seed || rawId)),
+			itemId: undefined,
+		};
+	}
+	const rawCallId = rawId.slice(0, separatorIndex);
+	const rawItemId = rawId.slice(separatorIndex + 1);
+	const fallbackSeed = rawCallId || rawItemId || seed || rawId;
+	return {
+		callId: normalizeResponsesIdPart(rawCallId, fallbackResponsesCallId(fallbackSeed)),
+		itemId: rawItemId,
+	};
+}
+
 export interface OpenAIResponsesStreamOptions {
 	serviceTier?: ResponseCreateParamsStreaming["service_tier"];
 	resolveServiceTier?: (
@@ -94,12 +127,7 @@ export function convertResponsesMessages<TApi extends Api>(
 	options?: ConvertResponsesMessagesOptions,
 ): ResponseInput {
 	const messages: ResponseInput = [];
-
-	const normalizeIdPart = (part: string): string => {
-		const sanitized = part.replace(/[^a-zA-Z0-9_-]/g, "_");
-		const normalized = sanitized.length > 64 ? sanitized.slice(0, 64) : sanitized;
-		return normalized.replace(/_+$/, "");
-	};
+	const emittedCallIds = new Set<string>();
 
 	const buildForeignResponsesItemId = (itemId: string): string => {
 		const normalized = `fc_${shortHash(itemId)}`;
@@ -107,15 +135,24 @@ export function convertResponsesMessages<TApi extends Api>(
 	};
 
 	const normalizeToolCallId = (id: string, _targetModel: Model<TApi>, source: AssistantMessage): string => {
-		if (!allowedToolCallProviders.has(model.provider)) return normalizeIdPart(id);
-		if (!id.includes("|")) return normalizeIdPart(id);
+		if (!allowedToolCallProviders.has(model.provider))
+			return normalizeResponsesIdPart(id, fallbackResponsesCallId(id));
+		if (!id.includes("|")) return normalizeResponsesIdPart(id, fallbackResponsesCallId(id));
 		const [callId, itemId] = id.split("|");
-		const normalizedCallId = normalizeIdPart(callId);
+		const normalizedCallId = normalizeResponsesIdPart(
+			callId,
+			fallbackResponsesCallId(`${source.provider}|${source.api}|${source.model}|${itemId}|${id}`),
+		);
 		const isForeignToolCall = source.provider !== model.provider || source.api !== model.api;
-		let normalizedItemId = isForeignToolCall ? buildForeignResponsesItemId(itemId) : normalizeIdPart(itemId);
+		let normalizedItemId = isForeignToolCall
+			? buildForeignResponsesItemId(itemId)
+			: normalizeResponsesIdPart(itemId, fallbackResponsesItemId(`${id}|${normalizedCallId}`));
 		// OpenAI Responses API requires item id to start with "fc"
 		if (!normalizedItemId.startsWith("fc_")) {
-			normalizedItemId = normalizeIdPart(`fc_${normalizedItemId}`);
+			normalizedItemId = normalizeResponsesIdPart(
+				`fc_${normalizedItemId}`,
+				fallbackResponsesItemId(normalizedItemId),
+			);
 		}
 		return `${normalizedCallId}|${normalizedItemId}`;
 	};
@@ -193,7 +230,10 @@ export function convertResponsesMessages<TApi extends Api>(
 					} satisfies ResponseOutputMessage);
 				} else if (block.type === "toolCall") {
 					const toolCall = block as ToolCall;
-					const [callId, itemIdRaw] = toolCall.id.split("|");
+					const toolCallSeed = `${assistantMsg.provider}|${assistantMsg.api}|${assistantMsg.model}|${toolCall.name}|${JSON.stringify(
+						toolCall.arguments,
+					)}|${msgIndex}`;
+					const { callId, itemId: itemIdRaw } = splitResponsesToolId(toolCall.id, toolCallSeed);
 					let itemId: string | undefined = itemIdRaw;
 
 					// For different-model messages, set id to undefined to avoid pairing validation.
@@ -201,6 +241,12 @@ export function convertResponsesMessages<TApi extends Api>(
 					// By omitting the id, we avoid triggering that validation (like cross-provider does).
 					if (isDifferentModel && itemId?.startsWith("fc_")) {
 						itemId = undefined;
+					}
+					if (itemId !== undefined) {
+						itemId = normalizeResponsesIdPart(itemId, fallbackResponsesItemId(`${toolCallSeed}|${callId}`));
+						if (!itemId.startsWith("fc_")) {
+							itemId = normalizeResponsesIdPart(`fc_${itemId}`, fallbackResponsesItemId(itemId));
+						}
 					}
 
 					output.push({
@@ -210,6 +256,7 @@ export function convertResponsesMessages<TApi extends Api>(
 						name: toolCall.name,
 						arguments: JSON.stringify(toolCall.arguments),
 					});
+					emittedCallIds.add(callId);
 				}
 			}
 			if (output.length === 0) continue;
@@ -221,7 +268,11 @@ export function convertResponsesMessages<TApi extends Api>(
 				.join("\n");
 			const hasImages = msg.content.some((c): c is ImageContent => c.type === "image");
 			const hasText = textResult.length > 0;
-			const [callId] = msg.toolCallId.split("|");
+			const { callId } = splitResponsesToolId(msg.toolCallId, `${msg.toolName}|${textResult}|${msgIndex}`);
+			if (!emittedCallIds.has(callId)) {
+				msgIndex++;
+				continue;
+			}
 
 			let output: string | ResponseFunctionCallOutputItemList;
 			if (hasImages && model.input.includes("image")) {
@@ -308,10 +359,25 @@ export async function processResponsesStream<TApi extends Api>(
 				output.content.push(currentBlock);
 				stream.push({ type: "text_start", contentIndex: blockIndex(), partial: output });
 			} else if (item.type === "function_call") {
-				currentItem = item;
+				const rawItemId =
+					typeof item.id === "string" && item.id.trim()
+						? item.id
+						: fallbackResponsesItemId(`${item.name}|${item.arguments}|${blocks.length}`);
+				let itemId = normalizeResponsesIdPart(
+					rawItemId,
+					fallbackResponsesItemId(`${item.name}|${item.arguments}|${blocks.length}`),
+				);
+				if (!itemId.startsWith("fc_")) {
+					itemId = normalizeResponsesIdPart(`fc_${itemId}`, fallbackResponsesItemId(`${rawItemId}|${item.name}`));
+				}
+				const callId = normalizeResponsesIdPart(
+					item.call_id,
+					fallbackResponsesCallId(`${itemId}|${item.name}|${item.arguments}|${blocks.length}`),
+				);
+				currentItem = { ...item, id: itemId, call_id: callId };
 				currentBlock = {
 					type: "toolCall",
-					id: `${item.call_id}|${item.id}`,
+					id: `${callId}|${itemId}`,
 					name: item.name,
 					arguments: {},
 					partialJson: item.arguments || "",
@@ -474,9 +540,27 @@ export async function processResponsesStream<TApi extends Api>(
 					delete (currentBlock as { partialJson?: string }).partialJson;
 					toolCall = currentBlock;
 				} else {
+					const rawItemId =
+						typeof item.id === "string" && item.id.trim()
+							? item.id
+							: fallbackResponsesItemId(`${item.name}|${item.arguments}|${blocks.length}`);
+					let itemId = normalizeResponsesIdPart(
+						rawItemId,
+						fallbackResponsesItemId(`${item.name}|${item.arguments}|${blocks.length}`),
+					);
+					if (!itemId.startsWith("fc_")) {
+						itemId = normalizeResponsesIdPart(
+							`fc_${itemId}`,
+							fallbackResponsesItemId(`${rawItemId}|${item.name}`),
+						);
+					}
+					const callId = normalizeResponsesIdPart(
+						item.call_id,
+						fallbackResponsesCallId(`${itemId}|${item.name}|${item.arguments}|${blocks.length}`),
+					);
 					toolCall = {
 						type: "toolCall",
-						id: `${item.call_id}|${item.id}`,
+						id: `${callId}|${itemId}`,
 						name: item.name,
 						arguments: args,
 					};
