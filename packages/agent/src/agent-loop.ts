@@ -200,7 +200,7 @@ async function runLoop(
 			}
 
 			// Check for tool calls
-			const toolCalls = message.content.filter((c) => c.type === "toolCall");
+			const toolCalls = message.content.filter(isExecutableToolCall);
 
 			const toolResults: ToolResultMessage[] = [];
 			hasMoreToolCalls = false;
@@ -377,7 +377,7 @@ async function executeToolCalls(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallBatch> {
-	const toolCalls = assistantMessage.content.filter((c) => c.type === "toolCall");
+	const toolCalls = assistantMessage.content.filter(isExecutableToolCall);
 	const hasSequentialToolCall = toolCalls.some(
 		(tc) => currentContext.tools?.find((t) => t.name === tc.name)?.executionMode === "sequential",
 	);
@@ -385,6 +385,10 @@ async function executeToolCalls(
 		return executeToolCallsSequential(currentContext, assistantMessage, toolCalls, config, signal, emit);
 	}
 	return executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit);
+}
+
+function isExecutableToolCall(content: AssistantMessage["content"][number]): content is AgentToolCall {
+	return content.type === "toolCall" && content.id.trim().length > 0 && content.name.trim().length > 0;
 }
 
 type ExecutedToolCallBatch = {
