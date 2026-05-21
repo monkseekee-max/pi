@@ -307,6 +307,78 @@ describe("agentLoop with AgentMessage", () => {
 		}
 	});
 
+	it("should ignore empty tool calls before execution", async () => {
+		const toolSchema = Type.Object({ value: Type.String() });
+		const executed: Array<{ id: string; value: string }> = [];
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute(toolCallId, params) {
+				executed.push({ id: toolCallId, value: params.value });
+				return {
+					content: [{ type: "text", text: `echoed: ${params.value}` }],
+					details: { value: params.value },
+				};
+			},
+		};
+
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [tool],
+		};
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+		};
+
+		let callIndex = 0;
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (callIndex === 0) {
+					const message = createAssistantMessage(
+						[
+							{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "hello" } },
+							{ type: "toolCall", id: "", name: "", arguments: { value: "ghost" } },
+						],
+						"toolUse",
+					);
+					stream.push({ type: "done", reason: "toolUse", message });
+				} else {
+					stream.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessage([{ type: "text", text: "done" }]),
+					});
+				}
+				callIndex++;
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("echo something")], context, config, undefined, streamFn);
+		for await (const event of stream) {
+			events.push(event);
+		}
+		const messages = await stream.result();
+
+		expect(executed).toEqual([{ id: "tool-1", value: "hello" }]);
+
+		const toolStarts = events.filter((event) => event.type === "tool_execution_start");
+		expect(toolStarts).toHaveLength(1);
+		expect(toolStarts[0]).toMatchObject({ toolCallId: "tool-1", toolName: "echo" });
+
+		const toolResults = messages.filter((message) => message.role === "toolResult");
+		expect(toolResults).toHaveLength(1);
+		expect(toolResults[0]).toMatchObject({ toolCallId: "tool-1", toolName: "echo", isError: false });
+		expect(JSON.stringify(messages)).not.toContain("Tool  not found");
+	});
+
 	it("should execute mutated beforeToolCall args without revalidation", async () => {
 		const toolSchema = Type.Object({ value: Type.String() });
 		const executed: Array<string | number> = [];
