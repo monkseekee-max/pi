@@ -2,9 +2,11 @@
 
 ## [Unreleased]
 
+## [0.79.4] - 2026-06-15
+
 ### Added
 
-- Added terminal background color query support for OSC 11 replies.
+- Added terminal background color query support for OSC 11 replies ([#5385](https://github.com/earendil-works/pi/pull/5385) by [@vegarsti](https://github.com/vegarsti)).
 
 ### Fixed
 
