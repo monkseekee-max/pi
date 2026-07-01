@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { convertMessages } from "../src/providers/openai-completions.ts";
-import { convertResponsesMessages } from "../src/providers/openai-responses-shared.ts";
+import { convertMessages } from "../src/api/openai-completions.ts";
+import { convertResponsesMessages } from "../src/api/openai-responses-shared.ts";
 import type { AssistantMessage, Context, Model, ToolResultMessage, Usage } from "../src/types.ts";
 
 const usage: Usage = {
@@ -37,6 +37,7 @@ const completionsCompat: Parameters<typeof convertMessages>[2] = {
 	supportsReasoningEffort: false,
 	supportsUsageInStreaming: true,
 	maxTokensField: "max_completion_tokens",
+	chatTemplateKwargs: {},
 	requiresToolResultName: false,
 	requiresAssistantAfterToolResult: false,
 	requiresThinkingAsText: false,
